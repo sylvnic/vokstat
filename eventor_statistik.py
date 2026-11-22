@@ -10,7 +10,6 @@ Skapar två filer som kan läggas ut på hemsidan:
 Användning:
   export EVENTOR_API_KEY="din-nyckel"
   python eventor_statistik.py --from-year 2025
-  python eventor_statistik.py --from-year 2025 --debug   # sparar rå-XML i ./raw
 
 Kräver: pip install requests
 """
@@ -19,6 +18,7 @@ import calendar
 import json
 import os
 import sys
+import time
 from datetime import date
 from xml.etree import ElementTree as ET
 
@@ -64,28 +64,77 @@ def get_own_org_id(session):
     sys.exit("Kunde inte läsa organisations-ID från organisation/apiKey.")
 
 
-def parse_results(xml_bytes):
-    """Returnerar (antal starter, mängd med unika person-id)."""
+def status_of(result):
+    """Status för ett resultat (både IOF-format och Eventors eget format)."""
+    if result is None:
+        return None
+    s = find_text(result, "Status")
+    if s:
+        return s
+    cs = find_child(result, "CompetitorStatus")
+    return cs.get("value") if cs is not None else None
+
+
+def date_of(resultlist, personresult):
+    """Datum (yyyy-mm-dd) för tävlingen, eller None om det inte hittas."""
+    ev = find_child(resultlist, "Event")
+    for path in (("StartDate", "Date"), ("EventRace", "RaceDate", "Date"),
+                 ("StartTime", "Date"), ("FinishDate", "Date")):
+        d = find_text(ev, *path)
+        if d:
+            return d[:10]
+    res = find_child(personresult, "Result")
+    d = find_text(res, "StartTime", "Date") or find_text(res, "StartTime")
+    return d[:10] if d else None
+
+
+def parse_person_results(xml_bytes, wanted_id):
+    """Returnerar lista med datum (yyyy-mm-dd) för varje start av personen."""
     root = ET.fromstring(xml_bytes)
-    starts = 0
-    people = set()
-    for pr in root.iter():
-        if local(pr.tag) != "PersonResult":
+    dates = []
+    for rl in root.iter():
+        if local(rl.tag) != "ResultList":
             continue
-        result = find_child(pr, "Result")
-        status = find_text(result, "Status") if result is not None else None
-        if status == "DidNotStart":
-            continue  # anmäld men startade inte
-        person = find_child(pr, "Person")
-        pid = find_text(person, "Id") or find_text(person, "PersonId")
-        if not pid:  # reserv: namn
-            given = find_text(person, "Name", "Given") or ""
-            family = find_text(person, "Name", "Family") or ""
-            pid = f"{given} {family}".strip() or None
-        starts += 1
-        if pid:
-            people.add(pid)
-    return starts, people
+        for pr in rl.iter():
+            if local(pr.tag) != "PersonResult":
+                continue
+            person = find_child(pr, "Person")
+            pid = find_text(person, "PersonId") or find_text(person, "Id")
+            if pid and wanted_id and pid != wanted_id:
+                continue  # inte den efterfrågade personen
+            if status_of(find_child(pr, "Result")) == "DidNotStart":
+                continue
+            d = date_of(rl, pr)
+            if d:
+                dates.append(d)
+    return dates
+
+
+def structure(root, limit=120):
+    """Lista över vilka XML-taggar som finns (inga personuppgifter)."""
+    paths = set()
+
+    def walk(el, path):
+        p = path + "/" + local(el.tag)
+        attrs = ",".join(sorted(local(a) for a in el.attrib))
+        paths.add(p + (f" [{attrs}]" if attrs else ""))
+        for c in el:
+            walk(c, p)
+
+    walk(root, "")
+    return sorted(paths)[:limit]
+
+
+def list_member_ids(session, org):
+    xml = get(session, f"persons/organisations/{org}")
+    root = ET.fromstring(xml)
+    ids = []
+    for el in root.iter():
+        if local(el.tag) == "Person":
+            pid = find_text(el, "PersonId") or find_text(el, "Id")
+            if pid:
+                ids.append(pid)
+    return sorted(set(ids))
 
 
 def month_range(from_year, today):
@@ -136,7 +185,6 @@ def main():
     ap.add_argument("--from-year", type=int, default=date.today().year)
     ap.add_argument("--org", help="Organisations-ID (hämtas annars från API-nyckeln)")
     ap.add_argument("--out", default=".", help="Katalog för utfiler")
-    ap.add_argument("--debug", action="store_true", help="Spara rå-XML i ./raw")
     args = ap.parse_args()
 
     key = os.environ.get("EVENTOR_API_KEY")
@@ -147,33 +195,64 @@ def main():
     session.headers["ApiKey"] = key
 
     org = args.org or get_own_org_id(session)
-    org_name = ""
-    if args.debug:
-        os.makedirs("raw", exist_ok=True)
+    members = list_member_ids(session, org)
+    print(f"Organisation {org}: {len(members)} medlemmar hittades", file=sys.stderr)
+    if not members:
+        sys.exit("Inga medlemmar hittades.")
 
-    rows = []
-    for y, m in month_range(args.from_year, date.today()):
-        last = calendar.monthrange(y, m)[1]
-        xml = get(
-            session, "results/organisation",
-            organisationIds=org,
-            fromDate=f"{y}-{m:02d}-01",
-            toDate=f"{y}-{m:02d}-{last:02d}",
-            includeSplitTimes="false",
-        )
-        if args.debug:
-            with open(f"raw/{y}-{m:02d}.xml", "wb") as f:
-                f.write(xml)
-        starts, people = parse_results(xml)
-        rows.append({"manad": f"{y}-{m:02d}", "starter": starts, "unika": len(people)})
-        print(f"{y}-{m:02d}: {starts} starter, {len(people)} unika", file=sys.stderr)
+    today = date.today()
+    months = {f"{y}-{m:02d}": {"starter": 0, "personer": set()}
+              for y, m in month_range(args.from_year, today)}
+    from_dt = f"{args.from_year}-01-01 00:00:00"
+    to_dt = f"{today.isoformat()} 23:59:59"
+
+    printed_structure = False
+    n_ok = n_empty = n_undated = 0
+    for pid in members:
+        r = session.get(BASE_URL + "results/person", timeout=60, params={
+            "personId": pid, "fromDate": from_dt, "toDate": to_dt,
+            "includeSplitTimes": "false"})
+        if r.status_code == 404:
+            n_empty += 1
+            continue
+        r.raise_for_status()
+        if not printed_structure:
+            root = ET.fromstring(r.content)
+            print("XML-struktur (första svaret):", file=sys.stderr)
+            for p in structure(root):
+                print("  " + p, file=sys.stderr)
+            printed_structure = True
+        dates = parse_person_results(r.content, pid)
+        if not dates:
+            n_empty += 1
+            continue
+        n_ok += 1
+        for d in dates:
+            ym = d[:7]
+            if ym in months:
+                months[ym]["starter"] += 1
+                months[ym]["personer"].add(pid)
+            else:
+                n_undated += 1
+        time.sleep(0.2)  # var snäll mot Eventor
+
+    print(f"Medlemmar med resultat: {n_ok}, utan: {n_empty}, "
+          f"starter utanför perioden: {n_undated}", file=sys.stderr)
+
+    rows = [{"manad": k, "starter": v["starter"], "unika": len(v["personer"])}
+            for k, v in sorted(months.items())]
+    for row in rows:
+        print(f"{row['manad']}: {row['starter']} starter, {row['unika']} unika",
+              file=sys.stderr)
+    if sum(r["starter"] for r in rows) == 0:
+        sys.exit("Inga starter hittades - se XML-strukturen ovan.")
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "statistik.json"), "w", encoding="utf-8") as f:
-        json.dump({"uppdaterad": date.today().isoformat(), "manader": rows},
+        json.dump({"uppdaterad": today.isoformat(), "manader": rows},
                   f, ensure_ascii=False, indent=2)
     with open(os.path.join(args.out, "statistik.html"), "w", encoding="utf-8") as f:
-        f.write(build_html(rows, org_name))
+        f.write(build_html(rows, ""))
 
 
 if __name__ == "__main__":
