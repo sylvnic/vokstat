@@ -2,10 +2,13 @@ name: Uppdatera tävlingsstatistik
 
 on:
   schedule:
-    - cron: "0 3 * * *"
-  workflow_dispatch:
+    # Måndagar. Två tider eftersom GitHub räknar i UTC; skriptet nedan
+    # väljer den som motsvarar kl 09 svensk tid (sommar- och vintertid).
+    - cron: "0 7 * * 1"
+    - cron: "0 8 * * 1"
+  workflow_dispatch:       # kör manuellt från Actions-fliken
   push:
-    branches: [main]
+    branches: [main]       # kör även när du ändrar filer i repot
 
 permissions:
   contents: read
@@ -19,16 +22,34 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
     steps:
+      - name: Kontrollera att klockan är 09 i Sverige
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif [ "$(TZ=Europe/Stockholm date +%H)" = "09" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Inte kl 09 i Sverige just nu - hoppar över denna körning."
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check.outputs.run == 'true'
 
       - uses: actions/setup-python@v5
+        if: steps.check.outputs.run == 'true'
         with:
           python-version: "3.12"
 
       - run: pip install -r requirements.txt
+        if: steps.check.outputs.run == 'true'
 
       - name: Hämta data från Eventor och bygg statistiken
+        if: steps.check.outputs.run == 'true'
         run: |
           python eventor_statistik.py --from-year 2025 --out public
           cp public/statistik.html public/index.html
@@ -36,13 +57,16 @@ jobs:
           EVENTOR_API_KEY: ${{ secrets.EVENTOR_API_KEY }}
 
       - uses: actions/configure-pages@v5
+        if: steps.check.outputs.run == 'true'
 
       - uses: actions/upload-pages-artifact@v3
+        if: steps.check.outputs.run == 'true'
         with:
           path: public
 
   deploy:
     needs: build
+    if: needs.build.outputs.run == 'true'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
