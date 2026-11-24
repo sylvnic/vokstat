@@ -4,6 +4,11 @@ Hämtar klubbens resultat från Eventor (Svenska Orienteringsförbundet) och
 bygger en statistiksida med starter och unika deltagare per månad, per
 tävlingstyp, samt en lista med antal startande per tävling.
 
+Tävlingar hittas på tre sätt som sedan slås ihop:
+  1. klubbens nuvarande medlemmars resultat (results/person)
+  2. klubbens anmälningar (entries)
+  3. klubbens resultat i varje funnen tävling (results/organisation)
+
 Skapar två filer som kan läggas ut på hemsidan:
   statistik.json  - data för statistiken
   statistik.html  - färdig sida (diagram, kryssrutor, lista)
@@ -22,6 +27,7 @@ import os
 import random
 import sys
 import time
+from collections import Counter
 from datetime import date
 from xml.etree import ElementTree as ET
 
@@ -36,7 +42,7 @@ LEVELS = {"1": "Mästerskap", "2": "Nationella", "3": "Distrikt",
 
 # Statusar som betyder att personen INTE startade
 NOT_STARTED = {"DidNotStart", "DidNotEnter", "Cancelled", "Inactive",
-               "Active", "Moved", "MovedUp"}
+               "Moved", "MovedUp"}
 
 LEVEL_TAGS = ("EventClassificationId", "ClassificationId")
 
@@ -78,10 +84,32 @@ def find_any(el, names):
     return None
 
 
+def request(session, endpoint, **params):
+    """GET med några nya försök. Returnerar svaret, eller None vid 404."""
+    last = None
+    for attempt in range(4):
+        try:
+            r = session.get(BASE_URL + endpoint, params=params, timeout=120)
+        except requests.RequestException as e:
+            last = e
+            time.sleep(2 * (attempt + 1))
+            continue
+        if r.status_code == 404:
+            return None
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = f"HTTP {r.status_code}"
+            time.sleep(3 * (attempt + 1))
+            continue
+        r.raise_for_status()
+        return r.content
+    raise RuntimeError(f"Anropet {endpoint} misslyckades: {last}")
+
+
 def get(session, endpoint, **params):
-    r = session.get(BASE_URL + endpoint, params=params, timeout=120)
-    r.raise_for_status()
-    return r.content
+    content = request(session, endpoint, **params)
+    if content is None:
+        sys.exit(f"Eventor svarade 404 (hittades inte) på {endpoint}.")
+    return content
 
 
 def get_own_org(session):
@@ -122,8 +150,8 @@ def date_of(resultlist, personresult):
     return d[:10] if d else None
 
 
-def parse_person_results(xml_bytes, wanted_id):
-    """Lista med en post per start: datum, event-id, namn, nivå."""
+def parse_results(xml_bytes, wanted_id=None):
+    """Alla personresultat i ett svar (med status), som en lista med dicts."""
     root = ET.fromstring(xml_bytes)
     out = []
     for rl in root.iter():
@@ -138,31 +166,53 @@ def parse_person_results(xml_bytes, wanted_id):
                 continue
             person = find_child(pr, "Person")
             pid = find_text(person, "PersonId") or find_text(person, "Id")
-            if pid and wanted_id and pid != wanted_id:
+            if wanted_id and pid and pid != wanted_id:
                 continue  # inte den efterfrågade personen
-            if status_of(find_child(pr, "Result")) in NOT_STARTED:
-                continue  # startade inte
-            d = date_of(rl, pr)
-            if d:
-                out.append({"date": d, "event_id": event_id,
-                            "name": name, "level": level})
+            out.append({"pid": pid,
+                        "status": status_of(find_child(pr, "Result")) or "okänd",
+                        "date": date_of(rl, pr), "event_id": event_id,
+                        "name": name, "level": level})
     return out
 
 
-def load_event_info(session, from_dt, to_dt):
-    """event-id -> (nivå, namn), hämtat med ett enda anrop."""
-    root = ET.fromstring(get(session, "events", fromDate=from_dt, toDate=to_dt))
-    print("XML-struktur för events (första 40 taggar):", file=sys.stderr)
-    for p in structure(root, 40):
+def entry_event_ids(session, org, from_dt, to_dt):
+    """ID för tävlingar där klubbens medlemmar anmälts."""
+    xml = request(session, "entries", organisationIds=org,
+                  fromEventDate=from_dt, toEventDate=to_dt)
+    if xml is None:
+        return set()
+    root = ET.fromstring(xml)
+    print("XML-struktur för entries (första 25 taggar):", file=sys.stderr)
+    for p in structure(root, 25):
         print("  " + p, file=sys.stderr)
-    info = {}
-    for ev in root.iter():
-        if local(ev.tag) != "Event":
+    return {el.text.strip() for el in root.iter()
+            if local(el.tag) == "EventId" and el.text and el.text.strip()}
+
+
+def event_meta(session, ids):
+    """event-id -> (namn, datum, typ), hämtat 40 tävlingar åt gången."""
+    meta, ids, printed = {}, sorted(ids), False
+    for i in range(0, len(ids), 40):
+        xml = request(session, "events", eventIds=",".join(ids[i:i + 40]))
+        time.sleep(0.2)
+        if xml is None:
             continue
-        eid = find_text(ev, "EventId")
-        if eid:
-            info[eid] = (find_any(ev, LEVEL_TAGS), find_text(ev, "Name"))
-    return info
+        root = ET.fromstring(xml)
+        if not printed:
+            print("XML-struktur för events (första 40 taggar):", file=sys.stderr)
+            for p in structure(root, 40):
+                print("  " + p, file=sys.stderr)
+            printed = True
+        for ev in root.iter():
+            if local(ev.tag) != "Event":
+                continue
+            eid = find_text(ev, "EventId")
+            if not eid:
+                continue
+            d = find_text(ev, "StartDate", "Date") or find_text(ev, "EventRace", "RaceDate", "Date")
+            meta[eid] = (find_text(ev, "Name"), d[:10] if d else None,
+                         find_any(ev, LEVEL_TAGS))
+    return meta
 
 
 def structure(root, limit=120):
@@ -517,53 +567,101 @@ def main():
     from_dt = f"{args.from_year}-01-01 00:00:00"
     to_dt = f"{today.isoformat()} 23:59:59"
 
-    records = []
-    printed_structure = False
-    n_ok = n_empty = 0
+    pairs = {}        # (tävling, person) -> resultatpost
+    sources = {}      # tävling -> var den hittades
+    from_results = {}  # tävling -> (namn, datum, typ) enligt resultatsvaren
+    statuses = Counter()
+
+    def add_starts(recs, eid_default=None, pid_default=None):
+        found = False
+        for r in recs:
+            statuses[r["status"]] += 1
+            if r["status"] in NOT_STARTED:
+                continue
+            eid = r["event_id"] or eid_default or f'x|{r["name"]}|{r["date"]}'
+            pid = r["pid"] or pid_default
+            if not pid:
+                continue
+            r["event_id"], r["pid"] = eid, pid
+            pairs.setdefault((eid, pid), r)
+            from_results.setdefault(eid, (r["name"], r["date"], r["level"]))
+            sources.setdefault(eid, set())
+            found = True
+        return found
+
+    # 1) medlemmarnas resultat
+    printed = False
+    n_with = 0
     for pid in members:
-        r = session.get(BASE_URL + "results/person", timeout=120, params={
-            "personId": pid, "fromDate": from_dt, "toDate": to_dt,
-            "includeSplitTimes": "false"})
-        if r.status_code == 404:
-            n_empty += 1
+        xml = request(session, "results/person", personId=pid, fromDate=from_dt,
+                      toDate=to_dt, includeSplitTimes="false")
+        time.sleep(0.2)
+        if xml is None:
             continue
-        r.raise_for_status()
-        if not printed_structure:
-            print("XML-struktur (första svaret):", file=sys.stderr)
-            for p in structure(ET.fromstring(r.content)):
+        if not printed:
+            print("XML-struktur för results/person (första svaret):", file=sys.stderr)
+            for p in structure(ET.fromstring(xml)):
                 print("  " + p, file=sys.stderr)
-            printed_structure = True
-        starts = parse_person_results(r.content, pid)
-        n_ok += 1 if starts else 0
-        n_empty += 0 if starts else 1
-        for s in starts:
-            s["pid"] = pid
-            records.append(s)
-        time.sleep(0.2)  # var snäll mot Eventor
+            printed = True
+        recs = parse_results(xml, pid)
+        if add_starts(recs, pid_default=pid):
+            n_with += 1
+        for r in recs:
+            if r["status"] not in NOT_STARTED:
+                sources.setdefault(r["event_id"] or f"x|{r['name']}|{r['date']}", set()).add("medlem")
+    via_members = {e for e, s in sources.items() if "medlem" in s}
 
-    records = [r for r in records if int(r["date"][:4]) in years]
-    print(f"Medlemmar med starter: {n_ok}, utan: {n_empty}", file=sys.stderr)
+    # 2) klubbens anmälningar
+    via_entries = entry_event_ids(session, org, from_dt, to_dt)
+    for eid in via_entries:
+        sources.setdefault(eid, set()).add("anmälan")
 
-    # Saknas nivå eller namn i resultatsvaret slår vi upp dem i tävlingslistan
-    if any(r["level"] is None or not r["name"] for r in records):
-        info = load_event_info(session, from_dt, to_dt)
-        for r in records:
-            lvl, nm = info.get(r["event_id"], (None, None))
-            r["level"] = r["level"] or lvl
-            r["name"] = r["name"] or nm
+    # 3) klubbens resultat i varje tävling vi hittat
+    candidates = sorted(e for e in sources if e.isdigit())
+    print(f"Hittade {len(candidates)} tävlingar att kontrollera "
+          f"({len(via_members)} via medlemmar, {len(via_entries)} via anmälningar)",
+          file=sys.stderr)
+    for eid in candidates:
+        xml = request(session, "results/organisation", organisationIds=org,
+                      eventId=eid, includeSplitTimes="false")
+        time.sleep(0.2)
+        if xml is None:
+            continue
+        recs = parse_results(xml)
+        if add_starts(recs, eid_default=eid):
+            sources[eid].add("klubbresultat")
+
+    meta = event_meta(session, candidates)
+
+    records = []
+    for (eid, pid), r in pairs.items():
+        name, d, lvl = meta.get(eid, (None, None, None))
+        fn, fd, fl = from_results.get(eid, (None, None, None))
+        d = d or r["date"] or fd
+        if not d or int(d[:4]) not in years:
+            continue
+        records.append({"pid": pid, "event_id": eid,
+                        "name": name or fn or r["name"],
+                        "date": d, "level": lvl or fl or r["level"]})
+
+    print("Status i resultaten: " + ", ".join(f"{k}={v}" for k, v in
+          sorted(statuses.items())), file=sys.stderr)
+    if not records:
+        sys.exit("Inga starter hittades - se XML-strukturerna ovan.")
 
     payload = build_payload(records, years, club, today.isoformat())
     n_unknown = sum(1 for e in payload["e"] if e[2] == "okand")
     print(f"Starter: {len(payload['s'])} i {len(payload['e'])} tävlingar, "
           f"varav {n_unknown} tävlingar utan känd typ", file=sys.stderr)
-    per_month = {}
-    for ei, _ in payload["s"]:
-        ym = payload["e"][ei][1][:7]
-        per_month[ym] = per_month.get(ym, 0) + 1
-    for ym in sorted(per_month):
-        print(f"  {ym}: {per_month[ym]} starter", file=sys.stderr)
-    if not records:
-        sys.exit("Inga starter hittades - se XML-strukturen ovan.")
+
+    per_event = Counter(r["event_id"] for r in records)
+    info = {r["event_id"]: (r["date"], r["name"]) for r in records}
+    print("Senaste tävlingarna (datum, namn, antal startande, var funnen):",
+          file=sys.stderr)
+    for eid in sorted(info, key=lambda e: info[e][0], reverse=True)[:20]:
+        d, n = info[eid]
+        print(f"  {d}  {(n or '?')[:45]}: {per_event[eid]}  "
+              f"[{', '.join(sorted(sources.get(eid, [])))}]", file=sys.stderr)
 
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "statistik.json"), "w", encoding="utf-8") as f:
