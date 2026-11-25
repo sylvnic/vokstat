@@ -22,6 +22,7 @@ Filen fonts.css (typsnitt) ska ligga bredvid skriptet; saknas den används
 datorns vanliga typsnitt i stället.
 """
 import argparse
+import calendar
 import json
 import os
 import random
@@ -84,6 +85,10 @@ def find_any(el, names):
     return None
 
 
+class EventorError(Exception):
+    """Fel från Eventor (med svarstext när sådan finns)."""
+
+
 def request(session, endpoint, **params):
     """GET med några nya försök. Returnerar svaret, eller None vid 404."""
     last = None
@@ -100,9 +105,11 @@ def request(session, endpoint, **params):
             last = f"HTTP {r.status_code}"
             time.sleep(3 * (attempt + 1))
             continue
-        r.raise_for_status()
+        if r.status_code >= 400:
+            body = " ".join((getattr(r, "text", "") or "").split())[:300]
+            raise EventorError(f"HTTP {r.status_code} på {endpoint}: {body}")
         return r.content
-    raise RuntimeError(f"Anropet {endpoint} misslyckades: {last}")
+    raise EventorError(f"Anropet {endpoint} misslyckades: {last}")
 
 
 def get(session, endpoint, **params):
@@ -176,17 +183,53 @@ def parse_results(xml_bytes, wanted_id=None):
 
 
 def entry_event_ids(session, org, from_dt, to_dt):
-    """ID för tävlingar där klubbens medlemmar anmälts."""
-    xml = request(session, "entries", organisationIds=org,
-                  fromEventDate=from_dt, toEventDate=to_dt)
-    if xml is None:
-        return set()
-    root = ET.fromstring(xml)
-    print("XML-struktur för entries (första 25 taggar):", file=sys.stderr)
-    for p in structure(root, 25):
-        print("  " + p, file=sys.stderr)
-    return {el.text.strip() for el in root.iter()
-            if local(el.tag) == "EventId" and el.text and el.text.strip()}
+    """ID för tävlingar där klubbens medlemmar anmälts (extra källa).
+
+    Provar först hela perioden; ger Eventor fel provas månad för månad.
+    Går det inte alls hoppas steget över, resten av körningen påverkas inte.
+    """
+    printed = []
+
+    def fetch(f, t):
+        xml = request(session, "entries", organisationIds=org,
+                      fromEventDate=f, toEventDate=t)
+        if xml is None:
+            return set()
+        root = ET.fromstring(xml)
+        if not printed:
+            print("XML-struktur för entries (första 25 taggar):", file=sys.stderr)
+            for p in structure(root, 25):
+                print("  " + p, file=sys.stderr)
+            printed.append(1)
+        return {el.text.strip() for el in root.iter()
+                if local(el.tag) == "EventId" and el.text and el.text.strip()}
+
+    try:
+        return fetch(from_dt, to_dt)
+    except EventorError as e:
+        print(f"Obs: entries för hela perioden gav fel ({e}). "
+              "Provar månad för månad.", file=sys.stderr)
+
+    ids, failed = set(), 0
+    start, end = date.fromisoformat(from_dt[:10]), date.fromisoformat(to_dt[:10])
+    y, m = start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        last = calendar.monthrange(y, m)[1]
+        try:
+            ids |= fetch(f"{y}-{m:02d}-01 00:00:00", f"{y}-{m:02d}-{last:02d} 23:59:59")
+        except EventorError as e:
+            failed += 1
+            if failed == 1:
+                print(f"Obs: entries för {y}-{m:02d} gav fel ({e})", file=sys.stderr)
+        time.sleep(0.2)
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    if failed:
+        print(f"Obs: anmälningar kunde inte hämtas för {failed} månader - "
+              "de tävlingarna hittas bara via medlemmarnas resultat.",
+              file=sys.stderr)
+    return ids
 
 
 def event_meta(session, ids):
